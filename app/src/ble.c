@@ -37,6 +37,10 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zmk/event_manager.h>
 #include <zmk/events/ble_active_profile_changed.h>
 
+#if IS_ENABLED(CONFIG_TOTEM_ADV_THROTTLE) && IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+#include <zmk/events/position_state_changed.h>
+#endif
+
 #if IS_ENABLED(CONFIG_ZMK_BLE_PASSKEY_ENTRY)
 #include <zmk/events/keycode_state_changed.h>
 
@@ -58,6 +62,20 @@ enum advertising_type {
 #define ZMK_ADV_CONN_NAME                                                                          \
     BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_USE_NAME | BT_LE_ADV_OPT_FORCE_NAME_IN_AD,  \
                     BT_GAP_ADV_FAST_INT_MIN_2, BT_GAP_ADV_FAST_INT_MAX_2, NULL)
+
+/* Totem advertising boost: denser open-adv while armed (see TOTEM_ADV_BOOST). */
+#if IS_ENABLED(CONFIG_TOTEM_ADV_THROTTLE) && IS_ENABLED(CONFIG_TOTEM_ADV_BOOST) &&                   \
+    IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+static bool totem_adv_boost_active = false;
+#else
+static const bool totem_adv_boost_active = false;
+#endif
+
+/* FAST_1 = 30-60 ms (boost), FAST_2 = 100-150 ms (ZMK default). Compound literals
+ * live for the full expression at the bt_le_adv_start call site. */
+#define ZMK_ADV_CONN_NAME_BOOST                                                                    \
+    BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_USE_NAME | BT_LE_ADV_OPT_FORCE_NAME_IN_AD,  \
+                    BT_GAP_ADV_FAST_INT_MIN_1, BT_GAP_ADV_FAST_INT_MAX_1, NULL)
 
 static struct zmk_ble_profile profiles[ZMK_BLE_PROFILE_COUNT];
 static uint8_t active_profile;
@@ -167,12 +185,114 @@ bool zmk_ble_profile_is_connected(uint8_t index) {
     advertising_status = ZMK_ADV_DIR;
 
 #define CHECKED_OPEN_ADV()                                                                         \
-    err = bt_le_adv_start(ZMK_ADV_CONN_NAME, zmk_ble_ad, ARRAY_SIZE(zmk_ble_ad), NULL, 0);         \
+    err = bt_le_adv_start(totem_adv_boost_active ? ZMK_ADV_CONN_NAME_BOOST : ZMK_ADV_CONN_NAME,    \
+                          zmk_ble_ad, ARRAY_SIZE(zmk_ble_ad), NULL, 0);                            \
     if (err) {                                                                                     \
         LOG_ERR("Advertising failed to start (err %d)", err);                                      \
         return err;                                                                                \
     }                                                                                              \
     advertising_status = ZMK_ADV_CONN;
+
+int update_advertising(void);
+
+#if IS_ENABLED(CONFIG_TOTEM_ADV_THROTTLE) && IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+static bool adv_throttled = false;
+static struct k_work_delayable adv_throttle_work;
+
+#if IS_ENABLED(CONFIG_TOTEM_ADV_BOOST)
+static struct k_work_delayable adv_boost_end_work;
+
+static void totem_adv_boost_arm(void) {
+    totem_adv_boost_active = true;
+    k_work_reschedule(&adv_boost_end_work, K_SECONDS(CONFIG_TOTEM_ADV_BOOST_SEC));
+}
+
+static void adv_boost_end_work_handler(struct k_work *work) {
+    ARG_UNUSED(work);
+    if (!totem_adv_boost_active) {
+        return;
+    }
+    totem_adv_boost_active = false;
+    if (advertising_status == ZMK_ADV_CONN && !zmk_ble_active_profile_is_connected()) {
+        LOG_INF("Advertising boost ended; returning to normal interval");
+        int err = bt_le_adv_stop();
+        if (err) {
+            LOG_ERR("Failed to stop advertising after boost (err %d)", err);
+            return;
+        }
+        advertising_status = ZMK_ADV_NONE;
+        update_advertising();
+    }
+}
+#endif /* CONFIG_TOTEM_ADV_BOOST */
+
+/* Fires once the selected host has been gone for the timeout: stop advertising to
+ * save power. A key press resumes it (see the listener below). */
+static void adv_throttle_work_handler(struct k_work *work) {
+    if (advertising_status == ZMK_ADV_CONN && !zmk_ble_active_profile_is_connected()) {
+        LOG_INF("Advertising idle timeout; pausing advertising until a key is pressed");
+        int err = bt_le_adv_stop();
+        if (err) {
+            LOG_ERR("Failed to pause advertising (err %d)", err);
+            return;
+        }
+        advertising_status = ZMK_ADV_NONE;
+        adv_throttled = true;
+    }
+}
+#endif
+
+#if IS_ENABLED(CONFIG_TOTEM_IDLE_DISCONNECT) && IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+static struct k_work_delayable idle_disconnect_work;
+/* Set when the idle timer force-disconnects the host, so the update_advertising()
+ * that runs on that disconnect goes dark immediately instead of re-advertising.
+ * Otherwise the host (especially a plugged-in / light-sleep Mac) reconnects within a
+ * second and wakes the display, and it repeats every timeout. Cleared as it fires. */
+static bool idle_go_dark = false;
+
+/* After CONFIG_TOTEM_IDLE_DISCONNECT_MIN minutes with no keypress, drop the active
+ * host so advertising can pause. A present host reconnects on the next keypress
+ * (which resumes advertising); an asleep/away host simply stays gone. */
+static void idle_disconnect_work_handler(struct k_work *work) {
+    if (!zmk_ble_active_profile_is_connected()) {
+        return;
+    }
+    struct bt_conn *conn = zmk_ble_active_profile_conn();
+    if (conn == NULL) {
+        return;
+    }
+    LOG_INF("Active host idle for %d min; disconnecting and going dark",
+            CONFIG_TOTEM_IDLE_DISCONNECT_MIN);
+    /* Mark go-dark *and* throttled before disconnect so any concurrent
+     * update_advertising path stays dark even if idle_go_dark is missed. */
+    idle_go_dark = true;
+    adv_throttled = true;
+    k_work_cancel_delayable(&adv_throttle_work);
+    /* 0x13 (remote user terminated) -- proven to let macOS reconnect and type
+     * cleanly (see the exclusive-host module). */
+    int err = bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+    if (err) {
+        LOG_ERR("Idle disconnect failed (err %d); clearing go-dark", err);
+        idle_go_dark = false;
+        adv_throttled = false;
+    }
+    bt_conn_unref(conn);
+}
+
+/* Deferred so disconnected() sees an updated conn table (same reason ZMK defers
+ * update_advertising). Cancels the idle timer only when the active host is gone;
+ * a background host leaving must not clear the countdown. */
+static void idle_disconnect_sync_work_handler(struct k_work *work) {
+    /* Active host still up (e.g. exclusive-host just dropped the other PC):
+     * leave the countdown alone. Only cancel when the selected host is gone. */
+    if (zmk_ble_active_profile_is_connected()) {
+        return;
+    }
+    k_work_cancel_delayable(&idle_disconnect_work);
+}
+
+static K_WORK_DEFINE(idle_disconnect_sync_work, idle_disconnect_sync_work_handler);
+#endif
 
 int update_advertising(void) {
     int err = 0;
@@ -193,6 +313,29 @@ int update_advertising(void) {
         // desired_adv = ZMK_ADV_DIR;
     }
     LOG_DBG("advertising from %d to %d", advertising_status, desired_adv);
+
+#if IS_ENABLED(CONFIG_TOTEM_ADV_THROTTLE) && IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+    if (desired_adv == ZMK_ADV_CONN) {
+#if IS_ENABLED(CONFIG_TOTEM_IDLE_DISCONNECT)
+        if (idle_go_dark) {
+            /* The idle timer just force-disconnected the host: pause instead of
+             * (re-)advertising, so the host can't reconnect and wake. No advertising is
+             * ever started, so there's no window for the host to grab. */
+            idle_go_dark = false;
+            adv_throttled = true;
+            k_work_cancel_delayable(&adv_throttle_work);
+        }
+#endif
+        if (adv_throttled) {
+            /* We deliberately paused advertising (idle throttle, or idle-disconnect
+             * go-dark) and stay dark until a real key press clears adv_throttled. Return
+             * here so nothing -- a background update_advertising(), or a phantom
+             * key-release from a split-link reconnect (release_peripheral_slot) -- can
+             * resurrect advertising and let the host reconnect + wake. */
+            return 0;
+        }
+    }
+#endif
 
     switch (desired_adv + CURR_ADV(advertising_status)) {
     case ZMK_ADV_NONE + CURR_ADV(ZMK_ADV_DIR):
@@ -216,12 +359,94 @@ int update_advertising(void) {
         break;
     }
 
+#if IS_ENABLED(CONFIG_TOTEM_ADV_THROTTLE) && IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+    if (advertising_status == ZMK_ADV_CONN) {
+        /* Advertising with the selected host not connected -> arm the idle timer.
+         * k_work_schedule (NOT reschedule) so a nearby other device's connect/
+         * disconnect churn does not keep resetting it. */
+        k_work_schedule(&adv_throttle_work, K_MINUTES(CONFIG_TOTEM_ADV_THROTTLE_TIMEOUT_MIN));
+    } else {
+        k_work_cancel_delayable(&adv_throttle_work);
+        adv_throttled = false;
+    }
+#endif
+
     return 0;
 };
 
 static void update_advertising_callback(struct k_work *work) { update_advertising(); }
 
 K_WORK_DEFINE(update_advertising_work, update_advertising_callback);
+
+#if IS_ENABLED(CONFIG_TOTEM_ADV_THROTTLE) && IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+/* A key press on either half (the central sees right-half presses over the split
+ * link) resumes advertising after the idle throttle paused it. First press or two
+ * may be lost while the host reconnects. */
+static int adv_throttle_keypress_listener(const zmk_event_t *eh) {
+    const struct zmk_position_state_changed *ev = as_zmk_position_state_changed(eh);
+    /* Only a real key PRESS counts as user presence. Ignore releases -- in particular
+     * the pressed=false events a split-link reconnect raises for positions it had
+     * tracked (release_peripheral_slot in split/bluetooth/central.c) -- so they can't
+     * wake a throttled/dark host. */
+    if (ev == NULL || !ev->state) {
+        return ZMK_EV_EVENT_BUBBLE;
+    }
+#if IS_ENABLED(CONFIG_TOTEM_IDLE_DISCONNECT)
+    /* Key press = user activity: restart the idle countdown. (Connect also arms
+     * the timer; this path resets it while typing.) */
+    k_work_reschedule(&idle_disconnect_work, K_MINUTES(CONFIG_TOTEM_IDLE_DISCONNECT_MIN));
+#endif
+    if (adv_throttled) {
+        adv_throttled = false;
+        LOG_INF("Key pressed; resuming advertising");
+#if IS_ENABLED(CONFIG_TOTEM_ADV_BOOST)
+        totem_adv_boost_arm();
+#endif
+        update_advertising();
+    }
+    return ZMK_EV_EVENT_BUBBLE;
+}
+
+ZMK_LISTENER(totem_adv_throttle, adv_throttle_keypress_listener);
+ZMK_SUBSCRIPTION(totem_adv_throttle, zmk_position_state_changed);
+
+/* Profile switch is an intentional host change: leave go-dark/throttle and
+ * advertise for the newly selected profile immediately. Without this, a switch
+ * while dark (or a race that left adv_throttled set) waits for another keypress
+ * before the target host can see the keyboard. */
+static int adv_throttle_profile_changed_listener(const zmk_event_t *eh) {
+    ARG_UNUSED(eh);
+#if IS_ENABLED(CONFIG_TOTEM_IDLE_DISCONNECT)
+    idle_go_dark = false;
+#endif
+    adv_throttled = false;
+#if IS_ENABLED(CONFIG_TOTEM_ADV_BOOST)
+    /* Dense advertising so the newly selected host finds us quickly. */
+    totem_adv_boost_arm();
+#endif
+    /* Restart advertising even if already open, so boost intervals take effect
+     * and we pick up a clean state after exclusive-host drops the old peer. */
+    if (advertising_status == ZMK_ADV_CONN || advertising_status == ZMK_ADV_DIR) {
+        int err = bt_le_adv_stop();
+        if (err) {
+            LOG_WRN("Failed to stop advertising on profile change (err %d)", err);
+        }
+        advertising_status = ZMK_ADV_NONE;
+    }
+    LOG_INF("Profile changed; advertising for active profile%s",
+#if IS_ENABLED(CONFIG_TOTEM_ADV_BOOST)
+            " (boost)"
+#else
+            ""
+#endif
+    );
+    update_advertising();
+    return ZMK_EV_EVENT_BUBBLE;
+}
+
+ZMK_LISTENER(totem_adv_throttle_profile, adv_throttle_profile_changed_listener);
+ZMK_SUBSCRIPTION(totem_adv_throttle_profile, zmk_ble_active_profile_changed);
+#endif
 
 static void clear_profile_bond(uint8_t profile) {
     if (bt_addr_le_cmp(&profiles[profile].peer, BT_ADDR_LE_ANY)) {
@@ -297,9 +522,16 @@ int zmk_ble_prof_select(uint8_t index) {
     active_profile = index;
     ble_save_profile();
 
-    update_advertising();
-
+#if IS_ENABLED(CONFIG_TOTEM_ADV_THROTTLE) && IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+    /* Raise first: exclusive-host drops the previous computer, then the profile
+     * listener arms advertising boost, then we (re)start advertising. Avoids
+     * advertising for the new profile while the old host still holds a link. */
     raise_profile_changed_event();
+    update_advertising();
+#else
+    update_advertising();
+    raise_profile_changed_event();
+#endif
 
     return 0;
 };
@@ -526,6 +758,13 @@ static void connected(struct bt_conn *conn, uint8_t err) {
         LOG_DBG("Active profile connected");
         k_work_submit(&raise_profile_changed_event_work);
     }
+#if IS_ENABLED(CONFIG_TOTEM_IDLE_DISCONNECT) && IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+    /* Arm idle-disconnect on host presence, not only on keypress. Covers the
+     * "host auto-reconnected / sat idle overnight without typing" path. */
+    if (zmk_ble_active_profile_is_connected()) {
+        k_work_reschedule(&idle_disconnect_work, K_MINUTES(CONFIG_TOTEM_IDLE_DISCONNECT_MIN));
+    }
+#endif
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason) {
@@ -551,6 +790,10 @@ static void disconnected(struct bt_conn *conn, uint8_t reason) {
         LOG_DBG("Active profile disconnected");
         k_work_submit(&raise_profile_changed_event_work);
     }
+#if IS_ENABLED(CONFIG_TOTEM_IDLE_DISCONNECT) && IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+    /* Defer: active_profile_is_connected() may still see this conn as live. */
+    k_work_submit(&idle_disconnect_sync_work);
+#endif
 }
 
 static void security_changed(struct bt_conn *conn, bt_security_t level, enum bt_security_err err) {
@@ -736,6 +979,16 @@ static int zmk_ble_init(void) {
         LOG_ERR("BLUETOOTH FAILED (%d)", err);
         return err;
     }
+
+#if IS_ENABLED(CONFIG_TOTEM_ADV_THROTTLE) && IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+    k_work_init_delayable(&adv_throttle_work, adv_throttle_work_handler);
+#if IS_ENABLED(CONFIG_TOTEM_ADV_BOOST)
+    k_work_init_delayable(&adv_boost_end_work, adv_boost_end_work_handler);
+#endif
+#if IS_ENABLED(CONFIG_TOTEM_IDLE_DISCONNECT)
+    k_work_init_delayable(&idle_disconnect_work, idle_disconnect_work_handler);
+#endif
+#endif
 
 #if IS_ENABLED(CONFIG_SETTINGS)
     settings_register(&profiles_handler);
