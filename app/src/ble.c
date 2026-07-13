@@ -64,7 +64,7 @@ enum advertising_type {
                     BT_GAP_ADV_FAST_INT_MIN_2, BT_GAP_ADV_FAST_INT_MAX_2, NULL)
 
 /* Totem advertising boost: denser open-adv while armed (see TOTEM_ADV_BOOST). */
-#if IS_ENABLED(CONFIG_TOTEM_ADV_THROTTLE) && IS_ENABLED(CONFIG_TOTEM_ADV_BOOST) &&                   \
+#if IS_ENABLED(CONFIG_TOTEM_ADV_THROTTLE) && IS_ENABLED(CONFIG_TOTEM_ADV_BOOST) &&                 \
     IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
 static bool totem_adv_boost_active = false;
 #else
