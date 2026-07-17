@@ -240,6 +240,21 @@ static void adv_throttle_work_handler(struct k_work *work) {
         adv_throttled = true;
     }
 }
+
+#if (CONFIG_TOTEM_EVICT_ADV_COOLDOWN_MS > 0)
+/* Delayed re-advertise after a background host leaves while the selected host
+ * is still away -- stops exclusive-host thrash from monopolizing the radio. */
+static void evict_adv_cooldown_work_handler(struct k_work *work) {
+    ARG_UNUSED(work);
+    if (zmk_ble_active_profile_is_connected()) {
+        return;
+    }
+    LOG_INF("Evict adv cooldown ended; updating advertising");
+    update_advertising();
+}
+
+static K_WORK_DELAYABLE_DEFINE(evict_adv_cooldown_work, evict_adv_cooldown_work_handler);
+#endif /* CONFIG_TOTEM_EVICT_ADV_COOLDOWN_MS */
 #endif
 
 #if IS_ENABLED(CONFIG_TOTEM_IDLE_DISCONNECT) && IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
@@ -399,6 +414,9 @@ static int adv_throttle_keypress_listener(const zmk_event_t *eh) {
     if (adv_throttled) {
         adv_throttled = false;
         LOG_INF("Key pressed; resuming advertising");
+#if (CONFIG_TOTEM_EVICT_ADV_COOLDOWN_MS > 0)
+        k_work_cancel_delayable(&evict_adv_cooldown_work);
+#endif
 #if IS_ENABLED(CONFIG_TOTEM_ADV_BOOST)
         totem_adv_boost_arm();
 #endif
@@ -420,6 +438,10 @@ static int adv_throttle_profile_changed_listener(const zmk_event_t *eh) {
     idle_go_dark = false;
 #endif
     adv_throttled = false;
+#if (CONFIG_TOTEM_EVICT_ADV_COOLDOWN_MS > 0)
+    /* Intentional host change: do not wait out a background-evict cooldown. */
+    k_work_cancel_delayable(&evict_adv_cooldown_work);
+#endif
 #if IS_ENABLED(CONFIG_TOTEM_ADV_BOOST)
     /* Dense advertising so the newly selected host finds us quickly. */
     totem_adv_boost_arm();
@@ -516,6 +538,29 @@ int zmk_ble_prof_select(uint8_t index) {
 
     LOG_DBG("profile %d", index);
     if (active_profile == index) {
+#if IS_ENABLED(CONFIG_TOTEM_RESELECT_RECONNECT) && IS_ENABLED(CONFIG_TOTEM_ADV_THROTTLE) &&         \
+    IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+        /* Soft recovery: re-selecting the active profile forces disconnect +
+         * re-advertise. Helps macOS half-dead "Connected but no typing" without
+         * a full Forget + re-pair when the bond itself is still good. */
+        LOG_INF("Re-select profile %d; forcing soft reconnect", index);
+#if IS_ENABLED(CONFIG_TOTEM_IDLE_DISCONNECT)
+        idle_go_dark = false;
+#endif
+        adv_throttled = false;
+#if IS_ENABLED(CONFIG_TOTEM_ADV_BOOST)
+        totem_adv_boost_arm();
+#endif
+        (void)zmk_ble_prof_disconnect(index);
+        if (advertising_status == ZMK_ADV_CONN || advertising_status == ZMK_ADV_DIR) {
+            int err = bt_le_adv_stop();
+            if (err) {
+                LOG_WRN("Failed to stop advertising on reselect (err %d)", err);
+            }
+            advertising_status = ZMK_ADV_NONE;
+        }
+        update_advertising();
+#endif
         return 0;
     }
 
@@ -784,7 +829,24 @@ static void disconnected(struct bt_conn *conn, uint8_t reason) {
 
     // We need to do this in a work callback, otherwise the advertising update will still see the
     // connection for a profile as active, and not start advertising yet.
+#if IS_ENABLED(CONFIG_TOTEM_ADV_THROTTLE) && IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL) &&          \
+    (CONFIG_TOTEM_EVICT_ADV_COOLDOWN_MS > 0)
+    /* Background host left (usually exclusive-host eviction) while the selected
+     * host is not up: delay open advertising so the wrong machine cannot
+     * reconnect in a tight loop and starve the target. Active-host disconnect
+     * and profile switch still re-advertise immediately. */
+    if (!is_conn_active_profile(conn) && !zmk_ble_active_profile_is_connected()) {
+        LOG_INF("Non-active host left; delaying advertising %d ms",
+                CONFIG_TOTEM_EVICT_ADV_COOLDOWN_MS);
+        k_work_reschedule(&evict_adv_cooldown_work,
+                          K_MSEC(CONFIG_TOTEM_EVICT_ADV_COOLDOWN_MS));
+    } else {
+        k_work_cancel_delayable(&evict_adv_cooldown_work);
+        k_work_submit(&update_advertising_work);
+    }
+#else
     k_work_submit(&update_advertising_work);
+#endif
 
     if (is_conn_active_profile(conn)) {
         LOG_DBG("Active profile disconnected");
