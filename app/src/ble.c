@@ -20,6 +20,9 @@
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/hci_types.h>
+#if IS_ENABLED(CONFIG_BT_SMP)
+#include <zephyr/bluetooth/keys.h>
+#endif
 
 #if IS_ENABLED(CONFIG_SETTINGS)
 
@@ -140,6 +143,27 @@ bool zmk_ble_active_profile_is_connected(void) {
     return zmk_ble_profile_is_connected(active_profile);
 }
 
+static void profile_connected_foreach(struct bt_conn *conn, void *data) {
+    struct {
+        uint8_t index;
+        bool found;
+    } *ctx = data;
+    struct bt_conn_info info;
+
+    if (ctx->found) {
+        return;
+    }
+    if (bt_conn_get_info(conn, &info) != 0 || info.role != BT_CONN_ROLE_PERIPHERAL) {
+        return;
+    }
+    if (info.state != BT_CONN_STATE_CONNECTED) {
+        return;
+    }
+    if (zmk_ble_profile_index(bt_conn_get_dst(conn)) == ctx->index) {
+        ctx->found = true;
+    }
+}
+
 bool zmk_ble_profile_is_connected(uint8_t index) {
     if (index >= ZMK_BLE_PROFILE_COUNT) {
         return false;
@@ -149,15 +173,19 @@ bool zmk_ble_profile_is_connected(uint8_t index) {
     bt_addr_le_t *addr = &profiles[index].peer;
     if (!bt_addr_le_cmp(addr, BT_ADDR_LE_ANY)) {
         return false;
-    } else if ((conn = bt_conn_lookup_addr_le(BT_ID_DEFAULT, addr)) == NULL) {
-        return false;
+    } else if ((conn = bt_conn_lookup_addr_le(BT_ID_DEFAULT, addr)) != NULL) {
+        bt_conn_get_info(conn, &info);
+        bt_conn_unref(conn);
+        return info.state == BT_CONN_STATE_CONNECTED;
     }
 
-    bt_conn_get_info(conn, &info);
-
-    bt_conn_unref(conn);
-
-    return info.state == BT_CONN_STATE_CONNECTED;
+    /* RPA-safe fallback: any host conn whose resolved profile is this index. */
+    struct {
+        uint8_t index;
+        bool found;
+    } ctx = {.index = index, .found = false};
+    bt_conn_foreach(BT_CONN_TYPE_LE, profile_connected_foreach, &ctx);
+    return ctx.found;
 }
 
 #define CHECKED_ADV_STOP()                                                                         \
@@ -184,21 +212,65 @@ bool zmk_ble_profile_is_connected(uint8_t index) {
     }                                                                                              \
     advertising_status = ZMK_ADV_DIR;
 
-#define CHECKED_OPEN_ADV()                                                                         \
-    err = bt_le_adv_start(totem_adv_boost_active ? ZMK_ADV_CONN_NAME_BOOST : ZMK_ADV_CONN_NAME,    \
-                          zmk_ble_ad, ARRAY_SIZE(zmk_ble_ad), NULL, 0);                            \
-    if (err) {                                                                                     \
-        LOG_ERR("Advertising failed to start (err %d)", err);                                      \
-        return err;                                                                                \
-    }                                                                                              \
-    advertising_status = ZMK_ADV_CONN;
-
 int update_advertising(void);
 
 #if IS_ENABLED(CONFIG_TOTEM_ADV_THROTTLE) && IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
 static bool adv_throttled = false;
 static struct k_work_delayable adv_throttle_work;
 
+/* Retry open advertising when start fails (often: background host still holds a
+ * connection slot). Keeps inviting the *active* profile instead of going dark. */
+static struct k_work_delayable open_adv_retry_work;
+#define OPEN_ADV_RETRY_MS 400
+#define OPEN_ADV_RETRY_MAX 25
+static uint8_t open_adv_retry_count;
+
+static void open_adv_retry_work_handler(struct k_work *work) {
+    ARG_UNUSED(work);
+    if (zmk_ble_active_profile_is_connected() || adv_throttled) {
+        open_adv_retry_count = 0;
+        return;
+    }
+    if (open_adv_retry_count >= OPEN_ADV_RETRY_MAX) {
+        LOG_WRN("Open advertising retry limit reached; giving up until next event");
+        open_adv_retry_count = 0;
+        return;
+    }
+    open_adv_retry_count++;
+    LOG_INF("Open advertising retry %u/%u", open_adv_retry_count, OPEN_ADV_RETRY_MAX);
+    if (update_advertising() != 0 && !zmk_ble_active_profile_is_connected()) {
+        k_work_schedule(&open_adv_retry_work, K_MSEC(OPEN_ADV_RETRY_MS));
+    } else if (advertising_status == ZMK_ADV_CONN) {
+        open_adv_retry_count = 0;
+    } else if (!zmk_ble_active_profile_is_connected()) {
+        k_work_schedule(&open_adv_retry_work, K_MSEC(OPEN_ADV_RETRY_MS));
+    }
+}
+
+static void open_adv_retry_arm(void) {
+    if (adv_throttled || zmk_ble_active_profile_is_connected()) {
+        return;
+    }
+    k_work_schedule(&open_adv_retry_work, K_MSEC(OPEN_ADV_RETRY_MS));
+}
+#endif
+
+#define CHECKED_OPEN_ADV()                                                                         \
+    err = bt_le_adv_start(totem_adv_boost_active ? ZMK_ADV_CONN_NAME_BOOST : ZMK_ADV_CONN_NAME,    \
+                          zmk_ble_ad, ARRAY_SIZE(zmk_ble_ad), NULL, 0);                            \
+    if (err == -EALREADY) {                                                                        \
+        advertising_status = ZMK_ADV_CONN;                                                         \
+        err = 0;                                                                                   \
+    } else if (err) {                                                                              \
+        /* Soft-fail: a background host may be holding the only free slot. Do not abort           \
+         * update_advertising; open_adv_retry will try again shortly. */                           \
+        LOG_WRN("Open advertising start failed (err %d); will retry", err);                        \
+        err = 0;                                                                                   \
+    } else {                                                                                       \
+        advertising_status = ZMK_ADV_CONN;                                                         \
+    }
+
+#if IS_ENABLED(CONFIG_TOTEM_ADV_THROTTLE) && IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
 #if IS_ENABLED(CONFIG_TOTEM_ADV_BOOST)
 static struct k_work_delayable adv_boost_end_work;
 
@@ -380,9 +452,17 @@ int update_advertising(void) {
          * k_work_schedule (NOT reschedule) so a nearby other device's connect/
          * disconnect churn does not keep resetting it. */
         k_work_schedule(&adv_throttle_work, K_MINUTES(CONFIG_TOTEM_ADV_THROTTLE_TIMEOUT_MIN));
+        open_adv_retry_count = 0;
+        k_work_cancel_delayable(&open_adv_retry_work);
     } else {
         k_work_cancel_delayable(&adv_throttle_work);
         adv_throttled = false;
+        /* Want open ads for the active host but are not advertising yet (e.g.
+         * background host still connected / stack rejected start). Keep trying. */
+        if (desired_adv == ZMK_ADV_CONN && !adv_throttled &&
+            !zmk_ble_active_profile_is_connected()) {
+            open_adv_retry_arm();
+        }
     }
 #endif
 
@@ -505,6 +585,19 @@ int zmk_ble_profile_index(const bt_addr_le_t *addr) {
             return i;
         }
     }
+#if IS_ENABLED(CONFIG_BT_SMP)
+    /* macOS (and other privacy centrals) often connect with an RPA. Resolve via
+     * the bond IRK so exclusive-host / HOG see the same profile as the stored
+     * identity address from pairing. */
+    struct bt_keys *keys = bt_keys_find_irk(BT_ID_DEFAULT, addr);
+    if (keys != NULL) {
+        for (int i = 0; i < ZMK_BLE_PROFILE_COUNT; i++) {
+            if (bt_addr_le_cmp(&keys->addr, &profiles[i].peer) == 0) {
+                return i;
+            }
+        }
+    }
+#endif
     return -ENODEV;
 }
 
@@ -615,6 +708,24 @@ int zmk_ble_prof_disconnect(uint8_t index) {
 
 bt_addr_le_t *zmk_ble_active_profile_addr(void) { return &profiles[active_profile].peer; }
 
+static void active_profile_conn_foreach(struct bt_conn *conn, void *data) {
+    struct bt_conn **out = data;
+    struct bt_conn_info info;
+
+    if (*out != NULL) {
+        return;
+    }
+    if (bt_conn_get_info(conn, &info) != 0 || info.role != BT_CONN_ROLE_PERIPHERAL) {
+        return;
+    }
+    if (info.state != BT_CONN_STATE_CONNECTED) {
+        return;
+    }
+    if (zmk_ble_profile_index(bt_conn_get_dst(conn)) == active_profile) {
+        *out = bt_conn_ref(conn);
+    }
+}
+
 struct bt_conn *zmk_ble_active_profile_conn(void) {
     struct bt_conn *conn;
     bt_addr_le_t *addr = zmk_ble_active_profile_addr();
@@ -622,11 +733,17 @@ struct bt_conn *zmk_ble_active_profile_conn(void) {
     if (!bt_addr_le_cmp(addr, BT_ADDR_LE_ANY)) {
         LOG_WRN("Not sending, no active address for current profile");
         return NULL;
-    } else if ((conn = bt_conn_lookup_addr_le(BT_ID_DEFAULT, addr)) == NULL) {
-        LOG_WRN("Not sending, not connected to active profile");
-        return NULL;
+    } else if ((conn = bt_conn_lookup_addr_le(BT_ID_DEFAULT, addr)) != NULL) {
+        return conn;
     }
 
+    /* Fallback: RPA / identity lag — find a live host conn that maps to the
+     * active profile via zmk_ble_profile_index (IRK-aware). */
+    conn = NULL;
+    bt_conn_foreach(BT_CONN_TYPE_LE, active_profile_conn_foreach, &conn);
+    if (conn == NULL) {
+        LOG_WRN("Not sending, not connected to active profile");
+    }
     return conn;
 }
 
@@ -771,6 +888,12 @@ static struct settings_handler profiles_handler = {
 #endif /* IS_ENABLED(CONFIG_SETTINGS) */
 
 static bool is_conn_active_profile(const struct bt_conn *conn) {
+    /* Prefer IRK-aware profile index over raw address equality so macOS RPAs
+     * still count as the active profile once the bond can resolve them. */
+    int idx = zmk_ble_profile_index(bt_conn_get_dst(conn));
+    if (idx >= 0) {
+        return idx == active_profile;
+    }
     return bt_addr_le_cmp(bt_conn_get_dst(conn), &profiles[active_profile].peer) == 0;
 }
 
@@ -1044,6 +1167,7 @@ static int zmk_ble_init(void) {
 
 #if IS_ENABLED(CONFIG_TOTEM_ADV_THROTTLE) && IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
     k_work_init_delayable(&adv_throttle_work, adv_throttle_work_handler);
+    k_work_init_delayable(&open_adv_retry_work, open_adv_retry_work_handler);
 #if IS_ENABLED(CONFIG_TOTEM_ADV_BOOST)
     k_work_init_delayable(&adv_boost_end_work, adv_boost_end_work_handler);
 #endif
