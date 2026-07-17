@@ -20,9 +20,6 @@
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/hci_types.h>
-#if IS_ENABLED(CONFIG_BT_SMP)
-#include <zephyr/bluetooth/keys.h>
-#endif
 
 #if IS_ENABLED(CONFIG_SETTINGS)
 
@@ -585,19 +582,26 @@ int zmk_ble_profile_index(const bt_addr_le_t *addr) {
             return i;
         }
     }
-#if IS_ENABLED(CONFIG_BT_SMP)
-    /* macOS (and other privacy centrals) often connect with an RPA. Resolve via
-     * the bond IRK so exclusive-host / HOG see the same profile as the stored
-     * identity address from pairing. */
-    struct bt_keys *keys = bt_keys_find_irk(BT_ID_DEFAULT, addr);
-    if (keys != NULL) {
-        for (int i = 0; i < ZMK_BLE_PROFILE_COUNT; i++) {
-            if (bt_addr_le_cmp(&keys->addr, &profiles[i].peer) == 0) {
-                return i;
-            }
+
+    /* macOS privacy: host may connect with an RPA while the profile stores the
+     * identity address. Do not use zephyr/bluetooth/keys.h (not public in our
+     * Zephyr). Instead: if a live connection is reachable by the stored
+     * identity and its current dst equals `addr`, it is this profile. */
+    for (int i = 0; i < ZMK_BLE_PROFILE_COUNT; i++) {
+        if (!bt_addr_le_cmp(&profiles[i].peer, BT_ADDR_LE_ANY)) {
+            continue;
+        }
+        struct bt_conn *conn = bt_conn_lookup_addr_le(BT_ID_DEFAULT, &profiles[i].peer);
+        if (conn == NULL) {
+            continue;
+        }
+        const bt_addr_le_t *dst = bt_conn_get_dst(conn);
+        bool match = (dst != NULL && bt_addr_le_cmp(dst, addr) == 0);
+        bt_conn_unref(conn);
+        if (match) {
+            return i;
         }
     }
-#endif
     return -ENODEV;
 }
 
