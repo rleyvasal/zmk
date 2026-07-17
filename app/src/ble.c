@@ -59,9 +59,11 @@ enum advertising_type {
 
 #define CURR_ADV(adv) (adv << 4)
 
+#define ZMK_ADV_OPTS_BASE                                                                          \
+    (BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_USE_NAME | BT_LE_ADV_OPT_FORCE_NAME_IN_AD)
+
 #define ZMK_ADV_CONN_NAME                                                                          \
-    BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_USE_NAME | BT_LE_ADV_OPT_FORCE_NAME_IN_AD,  \
-                    BT_GAP_ADV_FAST_INT_MIN_2, BT_GAP_ADV_FAST_INT_MAX_2, NULL)
+    BT_LE_ADV_PARAM(ZMK_ADV_OPTS_BASE, BT_GAP_ADV_FAST_INT_MIN_2, BT_GAP_ADV_FAST_INT_MAX_2, NULL)
 
 /* Totem advertising boost: denser open-adv while armed (see TOTEM_ADV_BOOST). */
 #if IS_ENABLED(CONFIG_TOTEM_ADV_THROTTLE) && IS_ENABLED(CONFIG_TOTEM_ADV_BOOST) &&                 \
@@ -74,8 +76,15 @@ static const bool totem_adv_boost_active = false;
 /* FAST_1 = 30-60 ms (boost), FAST_2 = 100-150 ms (ZMK default). Compound literals
  * live for the full expression at the bt_le_adv_start call site. */
 #define ZMK_ADV_CONN_NAME_BOOST                                                                    \
-    BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_USE_NAME | BT_LE_ADV_OPT_FORCE_NAME_IN_AD,  \
-                    BT_GAP_ADV_FAST_INT_MIN_1, BT_GAP_ADV_FAST_INT_MAX_1, NULL)
+    BT_LE_ADV_PARAM(ZMK_ADV_OPTS_BASE, BT_GAP_ADV_FAST_INT_MIN_1, BT_GAP_ADV_FAST_INT_MAX_1, NULL)
+
+#define ZMK_ADV_CONN_NAME_FILTER                                                                   \
+    BT_LE_ADV_PARAM(ZMK_ADV_OPTS_BASE | BT_LE_ADV_OPT_FILTER_CONN, BT_GAP_ADV_FAST_INT_MIN_2,      \
+                    BT_GAP_ADV_FAST_INT_MAX_2, NULL)
+
+#define ZMK_ADV_CONN_NAME_BOOST_FILTER                                                             \
+    BT_LE_ADV_PARAM(ZMK_ADV_OPTS_BASE | BT_LE_ADV_OPT_FILTER_CONN, BT_GAP_ADV_FAST_INT_MIN_1,      \
+                    BT_GAP_ADV_FAST_INT_MAX_1, NULL)
 
 static struct zmk_ble_profile profiles[ZMK_BLE_PROFILE_COUNT];
 static uint8_t active_profile;
@@ -252,20 +261,66 @@ static void open_adv_retry_arm(void) {
 }
 #endif
 
-#define CHECKED_OPEN_ADV()                                                                         \
-    err = bt_le_adv_start(totem_adv_boost_active ? ZMK_ADV_CONN_NAME_BOOST : ZMK_ADV_CONN_NAME,    \
-                          zmk_ble_ad, ARRAY_SIZE(zmk_ble_ad), NULL, 0);                            \
-    if (err == -EALREADY) {                                                                        \
-        advertising_status = ZMK_ADV_CONN;                                                         \
-        err = 0;                                                                                   \
-    } else if (err) {                                                                              \
-        /* Soft-fail: a background host may be holding the only free slot. Do not abort           \
-         * update_advertising; open_adv_retry will try again shortly. */                           \
-        LOG_WRN("Open advertising start failed (err %d); will retry", err);                        \
-        err = 0;                                                                                   \
-    } else {                                                                                       \
-        advertising_status = ZMK_ADV_CONN;                                                         \
+/* When the active profile is bonded, only that host may connect (FAL). Open
+ * profile uses unfiltered ads for pairing. Always defined so CHECKED_OPEN_ADV
+ * can call it; returns false when the feature is off or setup fails. */
+static bool totem_prepare_active_fal(void) {
+#if IS_ENABLED(CONFIG_TOTEM_ACTIVE_ADV_FILTER) && IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL) &&     \
+    IS_ENABLED(CONFIG_BT_FILTER_ACCEPT_LIST)
+    int err = bt_le_filter_accept_list_clear();
+    if (err) {
+        LOG_WRN("FAL clear failed (err %d)", err);
     }
+    if (zmk_ble_active_profile_is_open()) {
+        LOG_INF("Active profile open; advertising unfiltered for pairing");
+        return false;
+    }
+    bt_addr_le_t *peer = zmk_ble_active_profile_addr();
+    if (peer == NULL || !bt_addr_le_cmp(peer, BT_ADDR_LE_ANY)) {
+        return false;
+    }
+    err = bt_le_filter_accept_list_add(peer);
+    if (err) {
+        char addr[BT_ADDR_LE_STR_LEN];
+        bt_addr_le_to_str(peer, addr, sizeof(addr));
+        LOG_WRN("FAL add %s failed (err %d); advertising unfiltered", addr, err);
+        return false;
+    }
+    {
+        char addr[BT_ADDR_LE_STR_LEN];
+        bt_addr_le_to_str(peer, addr, sizeof(addr));
+        LOG_INF("FAL active host only: %s (profile %d)", addr, active_profile);
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
+#define CHECKED_OPEN_ADV()                                                                         \
+    do {                                                                                           \
+        bool use_fal = totem_prepare_active_fal();                                                 \
+        const struct bt_le_adv_param *adv_param;                                                   \
+        if (use_fal) {                                                                             \
+            adv_param = totem_adv_boost_active ? ZMK_ADV_CONN_NAME_BOOST_FILTER                     \
+                                               : ZMK_ADV_CONN_NAME_FILTER;                         \
+        } else {                                                                                   \
+            adv_param =                                                                            \
+                totem_adv_boost_active ? ZMK_ADV_CONN_NAME_BOOST : ZMK_ADV_CONN_NAME;              \
+        }                                                                                          \
+        err = bt_le_adv_start(adv_param, zmk_ble_ad, ARRAY_SIZE(zmk_ble_ad), NULL, 0);             \
+        if (err == -EALREADY) {                                                                    \
+            advertising_status = ZMK_ADV_CONN;                                                     \
+            err = 0;                                                                               \
+        } else if (err) {                                                                          \
+            /* Soft-fail: a background host may be holding the only free slot. Do not abort       \
+             * update_advertising; open_adv_retry will try again shortly. */                       \
+            LOG_WRN("Open advertising start failed (err %d); will retry", err);                    \
+            err = 0;                                                                               \
+        } else {                                                                                   \
+            advertising_status = ZMK_ADV_CONN;                                                     \
+        }                                                                                          \
+    } while (0)
 
 #if IS_ENABLED(CONFIG_TOTEM_ADV_THROTTLE) && IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
 #if IS_ENABLED(CONFIG_TOTEM_ADV_BOOST)
