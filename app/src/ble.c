@@ -297,11 +297,16 @@ static bool totem_prepare_active_fal(void) {
 #endif
 }
 
+static void totem_fal_clear_quiet(void) {
+#if IS_ENABLED(CONFIG_BT_FILTER_ACCEPT_LIST)
+    (void)bt_le_filter_accept_list_clear();
+#endif
+}
+
 #define CHECKED_OPEN_ADV()                                                                         \
     do {                                                                                           \
         bool use_fal = totem_prepare_active_fal();                                                 \
-        /* Pass compound literals directly into bt_le_adv_start (lifetime = full call).            \
-         * Do not store them in a pointer first. */                                                \
+        /* Pass compound literals directly into bt_le_adv_start (lifetime = full call). */         \
         if (use_fal) {                                                                             \
             err = bt_le_adv_start(totem_adv_boost_active ? ZMK_ADV_CONN_NAME_BOOST_FILTER          \
                                                          : ZMK_ADV_CONN_NAME_FILTER,               \
@@ -309,9 +314,7 @@ static bool totem_prepare_active_fal(void) {
             if (err && err != -EALREADY) {                                                         \
                 LOG_WRN("Filtered advertising failed (err %d); falling back to open", err);        \
                 use_fal = false;                                                                   \
-                if (IS_ENABLED(CONFIG_BT_FILTER_ACCEPT_LIST)) {                                    \
-                    (void)bt_le_filter_accept_list_clear();                                        \
-                }                                                                                  \
+                totem_fal_clear_quiet();                                                           \
             }                                                                                      \
         }                                                                                          \
         if (!use_fal) {                                                                            \
