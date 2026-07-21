@@ -369,7 +369,29 @@ static void adv_boost_end_work_handler(struct k_work *work) {
         return;
     }
     totem_adv_boost_active = false;
-    if (advertising_status == ZMK_ADV_CONN && !zmk_ble_active_profile_is_connected()) {
+
+    if (zmk_ble_active_profile_is_connected()) {
+        return;
+    }
+
+#if IS_ENABLED(CONFIG_TOTEM_ADV_POST_SWITCH_DARK)
+    /* Selected host did not connect during the boost window. Go dark so
+     * background bonded hosts cannot thrash open ads for minutes/hours
+     * (that thrash can kill the selected host's bond). Keypress resumes. */
+    LOG_INF("Post-switch boost ended; active host not up — advertising dark until keypress");
+    if (advertising_status == ZMK_ADV_CONN || advertising_status == ZMK_ADV_DIR) {
+        int err = bt_le_adv_stop();
+        if (err && err != -EALREADY) {
+            LOG_WRN("Failed to stop advertising for post-switch dark (err %d)", err);
+        }
+        advertising_status = ZMK_ADV_NONE;
+    }
+    adv_throttled = true;
+    open_adv_retry_count = 0;
+    k_work_cancel_delayable(&open_adv_retry_work);
+    return;
+#else
+    if (advertising_status == ZMK_ADV_CONN) {
         LOG_INF("Advertising boost ended; returning to normal interval");
         int err = bt_le_adv_stop();
         if (err) {
@@ -379,6 +401,7 @@ static void adv_boost_end_work_handler(struct k_work *work) {
         advertising_status = ZMK_ADV_NONE;
         update_advertising();
     }
+#endif /* CONFIG_TOTEM_ADV_POST_SWITCH_DARK */
 }
 #endif /* CONFIG_TOTEM_ADV_BOOST */
 
