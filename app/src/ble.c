@@ -361,6 +361,62 @@ static void adv_boost_end_work_handler(struct k_work *work) {
 }
 #endif /* CONFIG_TOTEM_ADV_BOOST */
 
+/* Totem dual-host helpers (config modules: reconnect_watch / exclusive_host).
+ * Never clear adv_throttled / idle_go_dark — that would resurrect overnight ads. */
+
+bool zmk_ble_totem_ads_suppressed(void) {
+    return adv_throttled;
+}
+
+/* Shared: densify or start open ads without clearing throttle/go-dark. */
+static void totem_restart_open_adv_if_running(void) {
+    if (adv_throttled) {
+        return;
+    }
+    if (zmk_ble_active_profile_is_connected()) {
+        return;
+    }
+    if (advertising_status == ZMK_ADV_CONN || advertising_status == ZMK_ADV_DIR) {
+        int err = bt_le_adv_stop();
+        if (err && err != -EALREADY) {
+            LOG_WRN("totem boost/kick: adv_stop err %d", err);
+        }
+        advertising_status = ZMK_ADV_NONE;
+        /* Brief ms-class gap only — NOT multi-second EVICT_ADV_COOLDOWN */
+    }
+    update_advertising();
+}
+
+void zmk_ble_totem_adv_boost_rearm(void) {
+#if IS_ENABLED(CONFIG_TOTEM_ADV_BOOST)
+    if (adv_throttled) {
+        return;
+    }
+    totem_adv_boost_arm();
+    totem_restart_open_adv_if_running();
+#else
+    /* Boost disabled: still kick open ads if dark (without densify restart). */
+    if (!adv_throttled && !zmk_ble_active_profile_is_connected() &&
+        advertising_status != ZMK_ADV_CONN && advertising_status != ZMK_ADV_DIR) {
+        update_advertising();
+    }
+#endif
+}
+
+void zmk_ble_totem_kick_open_adv(void) {
+    if (adv_throttled) {
+        return;
+    }
+    if (zmk_ble_active_profile_is_connected()) {
+        return;
+    }
+    if (advertising_status != ZMK_ADV_CONN && advertising_status != ZMK_ADV_DIR) {
+        update_advertising();
+    } else {
+        open_adv_retry_arm();
+    }
+}
+
 /* Fires once the selected host has been gone for the timeout: stop advertising to
  * save power. A key press resumes it (see the listener below). */
 static void adv_throttle_work_handler(struct k_work *work) {
@@ -1341,3 +1397,11 @@ ZMK_SUBSCRIPTION(zmk_ble, zmk_keycode_state_changed);
 #endif /* IS_ENABLED(CONFIG_ZMK_BLE_PASSKEY_ENTRY) */
 
 SYS_INIT(zmk_ble_init, APPLICATION, CONFIG_ZMK_BLE_INIT_PRIORITY);
+
+/* Totem helpers when throttle patch path is not compiled (peripheral half, or
+ * TOTEM_ADV_THROTTLE=n). Real implementations live inside the throttle block. */
+#if !(IS_ENABLED(CONFIG_TOTEM_ADV_THROTTLE) && IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL))
+bool zmk_ble_totem_ads_suppressed(void) { return false; }
+void zmk_ble_totem_adv_boost_rearm(void) {}
+void zmk_ble_totem_kick_open_adv(void) {}
+#endif
