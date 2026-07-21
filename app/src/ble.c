@@ -261,31 +261,50 @@ static void open_adv_retry_arm(void) {
 }
 #endif
 
-/* When the active profile is bonded, only that host may connect (FAL). Open
- * profile uses unfiltered ads for pairing. Always defined so CHECKED_OPEN_ADV
- * can call it; returns false when the feature is off or setup fails. */
+static void totem_fal_clear_quiet(void) {
+#if IS_ENABLED(CONFIG_BT_FILTER_ACCEPT_LIST)
+    (void)bt_le_filter_accept_list_clear();
+#endif
+}
+
+/* When the active profile is bonded, only that host may complete a connection
+ * (Filter Accept List + BT_LE_ADV_OPT_FILTER_CONN). Open/empty profiles use
+ * unfiltered ads for pairing. Background bonded hosts cannot thrash the link
+ * while another profile is selected — primary multi-host isolation fix.
+ *
+ * Returns true only when FAL is armed and filtered advertising should be used.
+ * Fail-open: any setup error → false (caller uses unfiltered open ads). */
 static bool totem_prepare_active_fal(void) {
 #if IS_ENABLED(CONFIG_TOTEM_ACTIVE_ADV_FILTER) && IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL) &&     \
     IS_ENABLED(CONFIG_BT_FILTER_ACCEPT_LIST)
-    int err = bt_le_filter_accept_list_clear();
-    if (err) {
-        LOG_WRN("FAL clear failed (err %d)", err);
-    }
     if (zmk_ble_active_profile_is_open()) {
-        LOG_INF("Active profile open; advertising unfiltered for pairing");
+        LOG_DBG("FAL skip: active profile open (pairing)");
+        totem_fal_clear_quiet();
         return false;
     }
     bt_addr_le_t *peer = zmk_ble_active_profile_addr();
     if (peer == NULL || !bt_addr_le_cmp(peer, BT_ADDR_LE_ANY)) {
+        LOG_DBG("FAL skip: no bonded peer on active profile");
+        totem_fal_clear_quiet();
         return false;
     }
+
+    int err = bt_le_filter_accept_list_clear();
+    if (err && err != -EALREADY) {
+        LOG_WRN("FAL clear failed (err %d); advertising unfiltered", err);
+        return false;
+    }
+
     err = bt_le_filter_accept_list_add(peer);
-    if (err) {
+    /* Already present is OK (some stacks return -EEXIST / -EALREADY). */
+    if (err && err != -EEXIST && err != -EALREADY) {
         char addr[BT_ADDR_LE_STR_LEN];
         bt_addr_le_to_str(peer, addr, sizeof(addr));
         LOG_WRN("FAL add %s failed (err %d); advertising unfiltered", addr, err);
+        totem_fal_clear_quiet();
         return false;
     }
+
     {
         char addr[BT_ADDR_LE_STR_LEN];
         bt_addr_le_to_str(peer, addr, sizeof(addr));
@@ -297,15 +316,10 @@ static bool totem_prepare_active_fal(void) {
 #endif
 }
 
-static void totem_fal_clear_quiet(void) {
-#if IS_ENABLED(CONFIG_BT_FILTER_ACCEPT_LIST)
-    (void)bt_le_filter_accept_list_clear();
-#endif
-}
-
 #define CHECKED_OPEN_ADV()                                                                         \
     do {                                                                                           \
         bool use_fal = totem_prepare_active_fal();                                                 \
+        bool fal_attempted = use_fal;                                                              \
         /* Pass compound literals directly into bt_le_adv_start (lifetime = full call). */         \
         if (use_fal) {                                                                             \
             err = bt_le_adv_start(totem_adv_boost_active ? ZMK_ADV_CONN_NAME_BOOST_FILTER          \
@@ -315,18 +329,25 @@ static void totem_fal_clear_quiet(void) {
                 LOG_WRN("Filtered advertising failed (err %d); falling back to open", err);        \
                 use_fal = false;                                                                   \
                 totem_fal_clear_quiet();                                                           \
+            } else {                                                                               \
+                LOG_DBG("Advertising started (FAL filtered, boost=%d)",                            \
+                        (int)totem_adv_boost_active);                                              \
             }                                                                                      \
         }                                                                                          \
         if (!use_fal) {                                                                            \
             err = bt_le_adv_start(totem_adv_boost_active ? ZMK_ADV_CONN_NAME_BOOST                 \
                                                          : ZMK_ADV_CONN_NAME,                      \
                                   zmk_ble_ad, ARRAY_SIZE(zmk_ble_ad), NULL, 0);                    \
+            if (fal_attempted && (err == 0 || err == -EALREADY)) {                                 \
+                LOG_WRN("Advertising open (unfiltered fallback after FAL)");                       \
+            }                                                                                      \
         }                                                                                          \
         if (err == -EALREADY) {                                                                    \
             advertising_status = ZMK_ADV_CONN;                                                     \
             err = 0;                                                                               \
         } else if (err) {                                                                          \
-            LOG_WRN("Open advertising start failed (err %d); will retry", err);                    \
+            LOG_WRN("Advertising start failed (err %d); will retry", err);                         \
+            advertising_status = ZMK_ADV_NONE;                                                     \
             err = 0;                                                                               \
         } else {                                                                                   \
             advertising_status = ZMK_ADV_CONN;                                                     \
