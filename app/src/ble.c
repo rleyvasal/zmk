@@ -202,21 +202,48 @@ bool zmk_ble_profile_is_connected(uint8_t index) {
         return err;                                                                                \
     }
 
+/* Directed advertising to the active bonded peer. Used after profile switch to
+ * invite that host faster than undirected discovery (helps Windows especially).
+ * Privacy centrals (macOS): include DIR_ADDR_RPA so TargetA can be the peer's
+ * RPA. Failures fall through to open undirected (caller handles). */
 #define CHECKED_DIR_ADV()                                                                          \
-    addr = zmk_ble_active_profile_addr();                                                          \
-    conn = bt_conn_lookup_addr_le(BT_ID_DEFAULT, addr);                                            \
-    if (conn != NULL) { /* TODO: Check status of connection */                                     \
-        LOG_DBG("Skipping advertising, profile host is already connected");                        \
-        bt_conn_unref(conn);                                                                       \
-        return 0;                                                                                  \
-    }                                                                                              \
-    err = bt_le_adv_start(BT_LE_ADV_CONN_DIR_LOW_DUTY(addr), zmk_ble_ad, ARRAY_SIZE(zmk_ble_ad),   \
-                          NULL, 0);                                                                \
-    if (err) {                                                                                     \
-        LOG_ERR("Advertising failed to start (err %d)", err);                                      \
-        return err;                                                                                \
-    }                                                                                              \
-    advertising_status = ZMK_ADV_DIR;
+    do {                                                                                           \
+        addr = zmk_ble_active_profile_addr();                                                      \
+        if (addr == NULL || !bt_addr_le_cmp(addr, BT_ADDR_LE_ANY)) {                               \
+            err = -EINVAL;                                                                         \
+            break;                                                                                 \
+        }                                                                                          \
+        conn = bt_conn_lookup_addr_le(BT_ID_DEFAULT, addr);                                        \
+        if (conn != NULL) {                                                                        \
+            LOG_DBG("Skipping directed advertising, profile host already connected");              \
+            bt_conn_unref(conn);                                                                   \
+            err = 0;                                                                               \
+            break;                                                                                 \
+        }                                                                                          \
+        /* Low-duty directed can run longer than high-duty (~1.28s cap). Peer may be               \
+         * a privacy central — request RPA TargetA when the stack supports it. */                  \
+        struct bt_le_adv_param dir_param =                                                         \
+            *BT_LE_ADV_CONN_DIR_LOW_DUTY(addr);                                                    \
+        dir_param.options |= BT_LE_ADV_OPT_DIR_ADDR_RPA;                                           \
+        err = bt_le_adv_start(&dir_param, zmk_ble_ad, ARRAY_SIZE(zmk_ble_ad), NULL, 0);            \
+        if (err) {                                                                                 \
+            /* Retry without RPA option (some peers / stacks reject it). */                        \
+            dir_param = *BT_LE_ADV_CONN_DIR_LOW_DUTY(addr);                                        \
+            err = bt_le_adv_start(&dir_param, zmk_ble_ad, ARRAY_SIZE(zmk_ble_ad), NULL, 0);        \
+        }                                                                                          \
+        if (err) {                                                                                 \
+            char addr_str[BT_ADDR_LE_STR_LEN];                                                     \
+            bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));                                   \
+            LOG_WRN("Directed advertising to %s failed (err %d)", addr_str, err);                  \
+            break;                                                                                 \
+        }                                                                                          \
+        advertising_status = ZMK_ADV_DIR;                                                          \
+        {                                                                                          \
+            char addr_str[BT_ADDR_LE_STR_LEN];                                                     \
+            bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));                                   \
+            LOG_INF("Directed advertising to %s (profile %d)", addr_str, active_profile);          \
+        }                                                                                          \
+    } while (0)
 
 int update_advertising(void);
 
@@ -230,6 +257,63 @@ static struct k_work_delayable open_adv_retry_work;
 #define OPEN_ADV_RETRY_MS 400
 #define OPEN_ADV_RETRY_MAX 25
 static uint8_t open_adv_retry_count;
+
+#if IS_ENABLED(CONFIG_TOTEM_DIR_THEN_OPEN)
+/* After BT_SEL: briefly use directed ads to the active peer, then open undirected
+ * boost. Speeds host discovery while exclusive-host still drops the other PC.
+ * Directed phase is skipped for open/empty profiles (pairing). */
+static bool totem_dir_phase_active;
+static struct k_work_delayable totem_dir_end_work;
+#if IS_ENABLED(CONFIG_TOTEM_ADV_BOOST)
+static void totem_adv_boost_arm(void);
+#endif
+
+static void totem_dir_phase_arm(void) {
+    if (zmk_ble_active_profile_is_open()) {
+        totem_dir_phase_active = false;
+        k_work_cancel_delayable(&totem_dir_end_work);
+        return;
+    }
+    bt_addr_le_t *peer = zmk_ble_active_profile_addr();
+    if (peer == NULL || !bt_addr_le_cmp(peer, BT_ADDR_LE_ANY)) {
+        totem_dir_phase_active = false;
+        k_work_cancel_delayable(&totem_dir_end_work);
+        return;
+    }
+    totem_dir_phase_active = true;
+    k_work_reschedule(&totem_dir_end_work, K_SECONDS(CONFIG_TOTEM_DIR_ADV_SEC));
+    LOG_INF("Directed-then-open: dir phase %d s for profile %d", CONFIG_TOTEM_DIR_ADV_SEC,
+            active_profile);
+}
+
+static void totem_dir_phase_clear(void) {
+    totem_dir_phase_active = false;
+    k_work_cancel_delayable(&totem_dir_end_work);
+}
+
+static void totem_dir_end_work_handler(struct k_work *work) {
+    ARG_UNUSED(work);
+    if (!totem_dir_phase_active) {
+        return;
+    }
+    totem_dir_phase_active = false;
+    if (zmk_ble_active_profile_is_connected() || adv_throttled) {
+        return;
+    }
+    LOG_INF("Directed phase ended; open undirected advertising (boost)");
+    if (advertising_status == ZMK_ADV_DIR || advertising_status == ZMK_ADV_CONN) {
+        int e = bt_le_adv_stop();
+        if (e && e != -EALREADY) {
+            LOG_WRN("Stop directed adv failed (err %d)", e);
+        }
+        advertising_status = ZMK_ADV_NONE;
+    }
+#if IS_ENABLED(CONFIG_TOTEM_ADV_BOOST)
+    totem_adv_boost_arm();
+#endif
+    update_advertising();
+}
+#endif /* CONFIG_TOTEM_DIR_THEN_OPEN */
 
 static void open_adv_retry_work_handler(struct k_work *work) {
     ARG_UNUSED(work);
@@ -552,20 +636,27 @@ int update_advertising(void) {
 
     if (zmk_ble_active_profile_is_open()) {
         desired_adv = ZMK_ADV_CONN;
+#if IS_ENABLED(CONFIG_TOTEM_DIR_THEN_OPEN) && IS_ENABLED(CONFIG_TOTEM_ADV_THROTTLE) &&             \
+    IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+        totem_dir_phase_clear();
+#endif
     } else if (!zmk_ble_active_profile_is_connected()) {
+#if IS_ENABLED(CONFIG_TOTEM_DIR_THEN_OPEN) && IS_ENABLED(CONFIG_TOTEM_ADV_THROTTLE) &&             \
+    IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+        /* Bonded active host: directed first (if phase armed), else open undirected. */
+        if (totem_dir_phase_active) {
+            desired_adv = ZMK_ADV_DIR;
+        } else {
+            desired_adv = ZMK_ADV_CONN;
+        }
+#else
         desired_adv = ZMK_ADV_CONN;
-        // Need to fix directed advertising for privacy centrals. See
-        // https://github.com/zephyrproject-rtos/zephyr/pull/14984 char
-        // addr_str[BT_ADDR_LE_STR_LEN]; bt_addr_le_to_str(zmk_ble_active_profile_addr(), addr_str,
-        // sizeof(addr_str));
-
-        // LOG_DBG("Directed advertising to %s", addr_str);
-        // desired_adv = ZMK_ADV_DIR;
+#endif
     }
     LOG_DBG("advertising from %d to %d", advertising_status, desired_adv);
 
 #if IS_ENABLED(CONFIG_TOTEM_ADV_THROTTLE) && IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
-    if (desired_adv == ZMK_ADV_CONN) {
+    if (desired_adv == ZMK_ADV_CONN || desired_adv == ZMK_ADV_DIR) {
 #if IS_ENABLED(CONFIG_TOTEM_IDLE_DISCONNECT)
         if (idle_go_dark) {
             /* The idle timer just force-disconnected the host: pause instead of
@@ -596,9 +687,24 @@ int update_advertising(void) {
     case ZMK_ADV_DIR + CURR_ADV(ZMK_ADV_CONN):
         CHECKED_ADV_STOP();
         CHECKED_DIR_ADV();
+        if (err) {
+            /* Directed failed — fall back to open undirected immediately. */
+#if IS_ENABLED(CONFIG_TOTEM_DIR_THEN_OPEN) && IS_ENABLED(CONFIG_TOTEM_ADV_THROTTLE) &&             \
+    IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+            totem_dir_phase_clear();
+#endif
+            CHECKED_OPEN_ADV();
+        }
         break;
     case ZMK_ADV_DIR + CURR_ADV(ZMK_ADV_NONE):
         CHECKED_DIR_ADV();
+        if (err) {
+#if IS_ENABLED(CONFIG_TOTEM_DIR_THEN_OPEN) && IS_ENABLED(CONFIG_TOTEM_ADV_THROTTLE) &&             \
+    IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+            totem_dir_phase_clear();
+#endif
+            CHECKED_OPEN_ADV();
+        }
         break;
     case ZMK_ADV_CONN + CURR_ADV(ZMK_ADV_DIR):
         CHECKED_ADV_STOP();
@@ -685,12 +791,16 @@ static int adv_throttle_profile_changed_listener(const zmk_event_t *eh) {
     /* Intentional host change: do not wait out a background-evict cooldown. */
     k_work_cancel_delayable(&evict_adv_cooldown_work);
 #endif
+#if IS_ENABLED(CONFIG_TOTEM_DIR_THEN_OPEN)
+    /* Directed invite for the newly selected bonded host, then open undirected. */
+    totem_dir_phase_arm();
+#endif
 #if IS_ENABLED(CONFIG_TOTEM_ADV_BOOST)
-    /* Dense advertising so the newly selected host finds us quickly. */
+    /* Dense open advertising after directed phase (or immediately if no dir). */
     totem_adv_boost_arm();
 #endif
-    /* Restart advertising even if already open, so boost intervals take effect
-     * and we pick up a clean state after exclusive-host drops the old peer. */
+    /* Restart advertising even if already open, so boost/dir take effect after
+     * exclusive-host drops the previous peer. */
     if (advertising_status == ZMK_ADV_CONN || advertising_status == ZMK_ADV_DIR) {
         int err = bt_le_adv_stop();
         if (err) {
@@ -698,7 +808,12 @@ static int adv_throttle_profile_changed_listener(const zmk_event_t *eh) {
         }
         advertising_status = ZMK_ADV_NONE;
     }
-    LOG_INF("Profile changed; advertising for active profile%s",
+    LOG_INF("Profile changed; advertising for active profile%s%s",
+#if IS_ENABLED(CONFIG_TOTEM_DIR_THEN_OPEN)
+            " (dir-then-open)"
+#else
+            ""
+#endif
 #if IS_ENABLED(CONFIG_TOTEM_ADV_BOOST)
             " (boost)"
 #else
@@ -1090,6 +1205,13 @@ static void connected(struct bt_conn *conn, uint8_t err) {
 
     LOG_DBG("Connected %s", addr);
 
+#if IS_ENABLED(CONFIG_TOTEM_DIR_THEN_OPEN) && IS_ENABLED(CONFIG_TOTEM_ADV_THROTTLE) &&             \
+    IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+    if (is_conn_active_profile(conn)) {
+        totem_dir_phase_clear();
+    }
+#endif
+
     update_advertising();
 
     if (is_conn_active_profile(conn)) {
@@ -1340,6 +1462,9 @@ static int zmk_ble_init(void) {
     k_work_init_delayable(&open_adv_retry_work, open_adv_retry_work_handler);
 #if IS_ENABLED(CONFIG_TOTEM_ADV_BOOST)
     k_work_init_delayable(&adv_boost_end_work, adv_boost_end_work_handler);
+#endif
+#if IS_ENABLED(CONFIG_TOTEM_DIR_THEN_OPEN)
+    k_work_init_delayable(&totem_dir_end_work, totem_dir_end_work_handler);
 #endif
 #if IS_ENABLED(CONFIG_TOTEM_IDLE_DISCONNECT)
     k_work_init_delayable(&idle_disconnect_work, idle_disconnect_work_handler);
