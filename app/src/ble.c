@@ -41,6 +41,11 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zmk/events/position_state_changed.h>
 #endif
 
+#if IS_ENABLED(CONFIG_TOTEM_RECOVERY_REBOOT)
+#include <zephyr/logging/log_ctrl.h>
+#include <zephyr/sys/reboot.h>
+#endif
+
 #if IS_ENABLED(CONFIG_ZMK_BLE_PASSKEY_ENTRY)
 #include <zmk/events/keycode_state_changed.h>
 
@@ -194,6 +199,47 @@ bool zmk_ble_profile_is_connected(uint8_t index) {
     return ctx.found;
 }
 
+#if IS_ENABLED(CONFIG_TOTEM_RPA_DISCONNECT)
+struct totem_profile_conn_ctx {
+    uint8_t index;
+    struct bt_conn *conn;
+};
+
+static void totem_profile_conn_foreach(struct bt_conn *conn, void *data) {
+    struct totem_profile_conn_ctx *ctx = data;
+    struct bt_conn_info info;
+
+    if (ctx->conn != NULL) {
+        return;
+    }
+    if (bt_conn_get_info(conn, &info) != 0 || info.role != BT_CONN_ROLE_PERIPHERAL) {
+        return;
+    }
+    if (info.state != BT_CONN_STATE_CONNECTED) {
+        return;
+    }
+    if (zmk_ble_profile_index(bt_conn_get_dst(conn)) == ctx->index) {
+        ctx->conn = bt_conn_ref(conn);
+    }
+}
+
+/* IRK-aware live conn lookup for any profile index -- the same resolution
+ * zmk_ble_profile_is_connected() above already does, made available to
+ * zmk_ble_prof_disconnect(). Without it that function looks the host up by stored
+ * *identity* address only, misses an RPA-connected host (macOS always connects
+ * under one), and returns -ENODEV. The result was a conn object that reported
+ * connected but nothing could tear down: update_advertising() then computed
+ * desired_adv = ZMK_ADV_NONE and stayed dark on purpose, every recovery path
+ * skipped on "active profile is connected", and repeated BT_SEL was a no-op --
+ * only a physical power cycle recovered. */
+static struct bt_conn *totem_profile_conn(uint8_t index) {
+    struct totem_profile_conn_ctx ctx = {.index = index, .conn = NULL};
+
+    bt_conn_foreach(BT_CONN_TYPE_LE, totem_profile_conn_foreach, &ctx);
+    return ctx.conn;
+}
+#endif /* CONFIG_TOTEM_RPA_DISCONNECT */
+
 #define CHECKED_ADV_STOP()                                                                         \
     err = bt_le_adv_stop();                                                                        \
     advertising_status = ZMK_ADV_NONE;                                                             \
@@ -247,6 +293,12 @@ bool zmk_ble_profile_is_connected(uint8_t index) {
 
 int update_advertising(void);
 
+/* Last genuine bt_le_adv_start() result: 0 means the controller really is
+ * advertising. CHECKED_OPEN_ADV keeps its fail-soft `err = 0` so callers still go
+ * on to retry, but the true error has to survive that for recovery decisions --
+ * a stack that refuses to advertise is the one case worth rebooting for. */
+static int totem_adv_start_err;
+
 #if IS_ENABLED(CONFIG_TOTEM_ADV_THROTTLE) && IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
 static bool adv_throttled = false;
 static struct k_work_delayable adv_throttle_work;
@@ -257,6 +309,16 @@ static struct k_work_delayable open_adv_retry_work;
 #define OPEN_ADV_RETRY_MS 400
 #define OPEN_ADV_RETRY_MAX 25
 static uint8_t open_adv_retry_count;
+
+#if IS_ENABLED(CONFIG_TOTEM_ADV_RECONCILE)
+/* Recovery state. Declared up here because the open-adv retry handler below is
+ * what detects "the stack will not advertise"; the rationale and the rest of the
+ * implementation are in the recovery block further down. */
+static bool totem_recovery_armed;
+static int64_t totem_last_reconcile_ms;
+static struct k_work_delayable totem_zombie_verify_work;
+static void totem_recovery_reboot(const char *why);
+#endif
 
 #if IS_ENABLED(CONFIG_TOTEM_DIR_THEN_OPEN)
 /* After BT_SEL: briefly use directed ads to the active peer, then open undirected
@@ -322,8 +384,16 @@ static void open_adv_retry_work_handler(struct k_work *work) {
         return;
     }
     if (open_adv_retry_count >= OPEN_ADV_RETRY_MAX) {
-        LOG_WRN("Open advertising retry limit reached; giving up until next event");
         open_adv_retry_count = 0;
+#if IS_ENABLED(CONFIG_TOTEM_ADV_RECONCILE)
+        /* Objective evidence: the user asked for this host and the stack refused to
+         * advertise for the whole budget. Not "the host is absent" -- a host that is
+         * merely away leaves totem_adv_start_err at 0. */
+        if (totem_recovery_armed && totem_adv_start_err != 0) {
+            totem_recovery_reboot("advertising start kept failing after user recovery");
+        }
+#endif
+        LOG_WRN("Open advertising retry limit reached; next keypress or BT_SEL retries");
         return;
     }
     open_adv_retry_count++;
@@ -428,13 +498,16 @@ static bool totem_prepare_active_fal(void) {
         }                                                                                          \
         if (err == -EALREADY) {                                                                    \
             advertising_status = ZMK_ADV_CONN;                                                     \
+            totem_adv_start_err = 0;                                                               \
             err = 0;                                                                               \
         } else if (err) {                                                                          \
             LOG_WRN("Advertising start failed (err %d); will retry", err);                         \
             advertising_status = ZMK_ADV_NONE;                                                     \
+            totem_adv_start_err = err;                                                             \
             err = 0;                                                                               \
         } else {                                                                                   \
             advertising_status = ZMK_ADV_CONN;                                                     \
+            totem_adv_start_err = 0;                                                               \
         }                                                                                          \
     } while (0)
 
@@ -574,6 +647,121 @@ static void evict_adv_cooldown_work_handler(struct k_work *work) {
 
 static K_WORK_DELAYABLE_DEFINE(evict_adv_cooldown_work, evict_adv_cooldown_work_handler);
 #endif /* CONFIG_TOTEM_EVICT_ADV_COOLDOWN_MS */
+
+#if IS_ENABLED(CONFIG_TOTEM_ADV_RECONCILE)
+/* --- Recovery from disagreement between our bookkeeping and reality ------------
+ *
+ * Two dead states were observed in the field (2026-07-24: macOS away 6 h, came
+ * back greyed out, keypresses and repeated BT_SEL 0 both useless, recovered only
+ * by physically power-cycling both halves):
+ *
+ *   1. A stale conn object for the selected host sits in BT_CONN_STATE_CONNECTED
+ *      while the host itself considers the link gone. zmk_ble_profile_is_connected()
+ *      resolves it and reports connected, so update_advertising() computes
+ *      desired_adv = ZMK_ADV_NONE and stays dark *on purpose*, while the keypress
+ *      listener, zmk_ble_totem_kick_open_adv() and reconnect_watch all bail out on
+ *      "the active profile is connected". Fixed by CONFIG_TOTEM_RPA_DISCONNECT,
+ *      which lets BT_SEL actually tear that conn down, plus the verify below.
+ *   2. advertising_status claims ZMK_ADV_CONN while the controller is not
+ *      advertising. update_advertising() then finds desired == current, matches no
+ *      switch case, and starts nothing -- forever.
+ *
+ * So on explicit user intent, trust neither flag: force the baseline and rebuild.
+ * Rebooting is the last resort and needs objective evidence, never just an absent
+ * host -- see totem_recovery_reboot(). */
+
+/* Cold reboot of the central. Equivalent to &sys_reset: bonds, profiles and
+ * settings live in NVS and are untouched. The peripheral half re-links on its own.
+ * Goal is that a charged keyboard never needs its power switches to recover. */
+static void totem_recovery_reboot(const char *why) {
+#if IS_ENABLED(CONFIG_TOTEM_RECOVERY_REBOOT)
+    /* Loop breaker: recovery state does not survive a reboot, so without an uptime
+     * floor a permanently broken controller could reboot, be asked to recover
+     * again, and reboot forever. */
+    if (k_uptime_get() < (int64_t)CONFIG_TOTEM_RECOVERY_REBOOT_MIN_UPTIME_SEC * 1000) {
+        LOG_WRN("Recovery reboot suppressed (%s): uptime below %d s", why,
+                CONFIG_TOTEM_RECOVERY_REBOOT_MIN_UPTIME_SEC);
+        return;
+    }
+    totem_recovery_armed = false;
+    LOG_ERR("BLE state unrecoverable (%s); cold reboot, bonds preserved", why);
+    LOG_PANIC(); /* flush the log synchronously -- deferred mode would lose it */
+    sys_reboot(SYS_REBOOT_COLD);
+#else
+    LOG_WRN("BLE state unrecoverable (%s); automatic reboot disabled", why);
+#endif
+}
+
+/* Second half of a BT_SEL teardown. bt_conn_disconnect() returning 0 only means
+ * the request was accepted; if the profile still reports connected this long
+ * after, the conn object is wedged and no amount of BT_SEL will fix it. */
+static void totem_zombie_verify_work_handler(struct k_work *work) {
+    ARG_UNUSED(work);
+    if (!zmk_ble_active_profile_is_connected()) {
+        return; /* teardown worked; disconnected() re-advertises */
+    }
+    if (!totem_recovery_armed) {
+        return;
+    }
+    totem_recovery_reboot("active profile still connected after disconnect");
+}
+
+/* Rebuild advertising for the selected profile from a known baseline, trusting
+ * neither advertising_status nor the throttle flag. Callers must have established
+ * that the selected host is NOT connected -- this never disconnects anything, so a
+ * keypress can never drop a healthy link. */
+static void totem_adv_reconcile(const char *why) {
+    int64_t now = k_uptime_get();
+
+    /* Restarting ads resets the advertising interval, so doing this per keystroke
+     * would make the keyboard harder to discover, not easier. */
+    if (totem_last_reconcile_ms != 0 &&
+        (now - totem_last_reconcile_ms) < CONFIG_TOTEM_ADV_RECONCILE_COOLDOWN_MS) {
+        return;
+    }
+    totem_last_reconcile_ms = now;
+    totem_recovery_armed = true;
+
+    LOG_WRN("Advertising reconcile (%s): status %d -> forced restart", why,
+            advertising_status);
+
+    k_work_cancel_delayable(&adv_throttle_work);
+    k_work_cancel_delayable(&open_adv_retry_work);
+#if (CONFIG_TOTEM_EVICT_ADV_COOLDOWN_MS > 0)
+    k_work_cancel_delayable(&evict_adv_cooldown_work);
+#endif
+#if IS_ENABLED(CONFIG_TOTEM_DIR_THEN_OPEN)
+    totem_dir_phase_clear();
+#endif
+    adv_throttled = false;
+    open_adv_retry_count = 0;
+
+    /* -EALREADY here means "was not advertising" -- exactly the state we are
+     * looking for, and the only way to detect it: the stack has no public "am I
+     * advertising?" query, so stopping is the probe. */
+    int err = bt_le_adv_stop();
+    if (err == -EALREADY) {
+        LOG_WRN("Reconcile: status said %d but controller was not advertising",
+                advertising_status);
+    } else if (err) {
+        LOG_WRN("Reconcile: adv_stop err %d (continuing)", err);
+    }
+    advertising_status = ZMK_ADV_NONE;
+
+#if IS_ENABLED(CONFIG_TOTEM_ADV_BOOST)
+    totem_adv_boost_arm();
+#endif
+    update_advertising();
+}
+
+/* The host is up: nothing left to recover, so no later failure can be blamed on
+ * this recovery attempt. */
+static void totem_recovery_disarm(void) {
+    totem_recovery_armed = false;
+    totem_last_reconcile_ms = 0;
+    k_work_cancel_delayable(&totem_zombie_verify_work);
+}
+#endif /* CONFIG_TOTEM_ADV_RECONCILE */
 #endif
 
 #if IS_ENABLED(CONFIG_TOTEM_IDLE_DISCONNECT) && IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
@@ -769,8 +957,22 @@ static int adv_throttle_keypress_listener(const zmk_event_t *eh) {
 #if IS_ENABLED(CONFIG_TOTEM_ADV_BOOST)
         totem_adv_boost_arm();
 #endif
+#if IS_ENABLED(CONFIG_TOTEM_ADV_RECONCILE)
+        totem_recovery_armed = true;
+#endif
         update_advertising();
+        return ZMK_EV_EVENT_BUBBLE;
     }
+#if IS_ENABLED(CONFIG_TOTEM_ADV_RECONCILE)
+    /* Not throttled and the selected host is down: typing is the user saying they
+     * expect that host. Before this, such a keypress did nothing at all -- the
+     * branch above was the only recovery path, so any state where the throttle flag
+     * had already been cleared (retry budget spent, ads believed running, zombie
+     * conn) was a dead end no keypress could leave. */
+    if (!zmk_ble_active_profile_is_connected()) {
+        totem_adv_reconcile("keypress, selected host down");
+    }
+#endif
     return ZMK_EV_EVENT_BUBBLE;
 }
 
@@ -929,7 +1131,23 @@ int zmk_ble_prof_select(uint8_t index) {
 #if IS_ENABLED(CONFIG_TOTEM_ADV_BOOST)
         totem_adv_boost_arm();
 #endif
+#if IS_ENABLED(CONFIG_TOTEM_ADV_RECONCILE)
+        /* Reselect is the strongest statement of intent the user can make, so it is
+         * also the one path allowed to tear down a host that *reports* connected.
+         * Arm recovery and verify the teardown really happened -- a conn object that
+         * survives this is wedged, and no further BT_SEL will help. */
+        totem_recovery_armed = true;
+        int disc = zmk_ble_prof_disconnect(index);
+        LOG_INF("Reselect profile %d: disconnect -> %d", index, disc);
+        if (disc == 0) {
+            k_work_reschedule(&totem_zombie_verify_work, K_MSEC(CONFIG_TOTEM_ZOMBIE_VERIFY_MS));
+        } else if (disc != -ENODEV && zmk_ble_active_profile_is_connected()) {
+            /* Reports connected, yet the stack will not even accept a disconnect. */
+            totem_recovery_reboot("disconnect refused for connected active host");
+        }
+#else
         (void)zmk_ble_prof_disconnect(index);
+#endif
         if (advertising_status == ZMK_ADV_CONN || advertising_status == ZMK_ADV_DIR) {
             int err = bt_le_adv_stop();
             if (err) {
@@ -981,7 +1199,16 @@ int zmk_ble_prof_disconnect(uint8_t index) {
     if (!bt_addr_le_cmp(addr, BT_ADDR_LE_ANY)) {
         return -ENODEV;
     } else if ((conn = bt_conn_lookup_addr_le(BT_ID_DEFAULT, addr)) == NULL) {
+#if IS_ENABLED(CONFIG_TOTEM_RPA_DISCONNECT)
+        /* Identity lookup missed: the host may be connected under an RPA. */
+        conn = totem_profile_conn(index);
+        if (conn == NULL) {
+            return -ENODEV;
+        }
+        LOG_INF("Profile %d: disconnecting RPA-matched host conn", index);
+#else
         return -ENODEV;
+#endif
     }
 
     result = bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
@@ -1216,6 +1443,11 @@ static void connected(struct bt_conn *conn, uint8_t err) {
 
     if (is_conn_active_profile(conn)) {
         LOG_DBG("Active profile connected");
+#if IS_ENABLED(CONFIG_TOTEM_ADV_RECONCILE) && IS_ENABLED(CONFIG_TOTEM_ADV_THROTTLE) &&             \
+    IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+        /* Recovery succeeded: nothing later can be blamed on this attempt. */
+        totem_recovery_disarm();
+#endif
         k_work_submit(&raise_profile_changed_event_work);
     }
 #if IS_ENABLED(CONFIG_TOTEM_IDLE_DISCONNECT) && IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
@@ -1241,6 +1473,16 @@ static void disconnected(struct bt_conn *conn, uint8_t reason) {
         LOG_DBG("SKIPPING FOR ROLE %d", info.role);
         return;
     }
+
+#if IS_ENABLED(CONFIG_TOTEM_ADV_RECONCILE) && IS_ENABLED(CONFIG_TOTEM_ADV_THROTTLE) &&             \
+    IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+    /* A host link really did go away, so any BT_SEL teardown we were verifying
+     * worked. Cancel the verify: by the time it would fire the host may already
+     * have reconnected (macOS often does within a second, sometimes under an RPA we
+     * have not resolved yet), and it must never mistake that for a wedged conn and
+     * reboot a healthy link. */
+    k_work_cancel_delayable(&totem_zombie_verify_work);
+#endif
 
     // We need to do this in a work callback, otherwise the advertising update will still see the
     // connection for a profile as active, and not start advertising yet.
@@ -1460,6 +1702,9 @@ static int zmk_ble_init(void) {
 #if IS_ENABLED(CONFIG_TOTEM_ADV_THROTTLE) && IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
     k_work_init_delayable(&adv_throttle_work, adv_throttle_work_handler);
     k_work_init_delayable(&open_adv_retry_work, open_adv_retry_work_handler);
+#if IS_ENABLED(CONFIG_TOTEM_ADV_RECONCILE)
+    k_work_init_delayable(&totem_zombie_verify_work, totem_zombie_verify_work_handler);
+#endif
 #if IS_ENABLED(CONFIG_TOTEM_ADV_BOOST)
     k_work_init_delayable(&adv_boost_end_work, adv_boost_end_work_handler);
 #endif
